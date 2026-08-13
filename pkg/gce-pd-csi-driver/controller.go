@@ -923,6 +923,12 @@ func (gceCS *GCEControllerServer) ControllerModifyVolume(ctx context.Context, re
 		return gceCS.convertDiskType(ctx, project, volKey, volumeID, existingDisk, volumeModifyParams)
 	}
 
+	// The disk reports the requested type, so any conversion that was under way
+	// has finished and can be recorded as complete.
+	if volumeModifyParams.DiskType != nil {
+		gceCS.finishConversionIfMarked(ctx, volKey.Name, volumeID, diskType)
+	}
+
 	// The disk is already the requested type. If no other attributes were
 	// requested there is nothing left to do, which is also how a completed
 	// conversion is reported as successful on a subsequent retry.
@@ -978,29 +984,64 @@ func (gceCS *GCEControllerServer) convertDiskType(ctx context.Context, project s
 		return nil, status.Errorf(codes.InvalidArgument, "cannot convert volume %s from %s to %s: disk type conversion is not supported for regional disks", volumeID, currentDiskType, targetDiskType)
 	}
 
-	// Conversion requires the disk to be detached. Report this as retryable so
-	// the conversion starts once the workload using the volume is scaled down.
+	// Multi-writer disks cannot be converted, and the access mode cannot be
+	// turned off, so this can never succeed either.
+	if existingDisk.GetMultiWriter() {
+		return nil, status.Errorf(codes.InvalidArgument, "cannot convert volume %s from %s to %s: disk type conversion is not supported for multi-writer disks", volumeID, currentDiskType, targetDiskType)
+	}
+
+	// Conversion requires the disk to be detached. Mark the volume so that the
+	// conversion is started when the disk is detached, and report the attach as
+	// a retryable failure in the meantime.
 	if users := existingDisk.GetUsers(); len(users) > 0 {
+		if err := markConversionPending(ctx, volKey.Name); err != nil {
+			klog.Errorf("Failed to mark volume %s for conversion: %v", volumeID, err)
+		}
 		return nil, status.Errorf(codes.FailedPrecondition, "cannot convert volume %s from %s to %s while it is attached to %v, detach the volume to start the conversion", volumeID, currentDiskType, targetDiskType, users)
 	}
 
-	klog.V(4).Infof("Converting volume %s from %s to %s", volumeID, currentDiskType, targetDiskType)
-	if err := gceCS.CloudProvider.ConvertDiskType(ctx, project, volKey, targetDiskType, params.IOPS, params.Throughput); err != nil {
-		klog.Errorf("Failed to convert volume %s from %s to %s: %v", volumeID, currentDiskType, targetDiskType, err)
-		switch {
-		case isConversionInProgressError(err):
-			// A conversion started by an earlier attempt is still running.
-			return nil, status.Errorf(codes.Unavailable, "conversion of volume %s from %s to %s is in progress", volumeID, currentDiskType, targetDiskType)
-		case isUnsupportedConversionIntentError(err):
-			return nil, status.Errorf(codes.InvalidArgument, "cannot convert volume %s from %s to %s: %v", volumeID, currentDiskType, targetDiskType, err)
-		default:
-			return nil, status.Errorf(codes.Unavailable, "failed to start conversion of volume %s from %s to %s: %v", volumeID, currentDiskType, targetDiskType, err)
-		}
+	if err := gceCS.startDiskConversion(ctx, project, volKey, volumeID, currentDiskType, targetDiskType, params); err != nil {
+		return nil, err
 	}
 
 	// The conversion has started but is not finished, so the requested
 	// attributes are not in effect yet.
 	return nil, status.Errorf(codes.Unavailable, "conversion of volume %s from %s to %s is in progress", volumeID, currentDiskType, targetDiskType)
+}
+
+// startDiskConversion starts the conversion and records it on the
+// PersistentVolume, so that the operation can be found again after a restart
+// and so that attach can tell that a conversion is under way.
+func (gceCS *GCEControllerServer) startDiskConversion(ctx context.Context, project string, volKey *meta.Key, volumeID, currentDiskType, targetDiskType string, params parameters.ModifyVolumeParameters) error {
+	klog.V(4).Infof("Converting volume %s from %s to %s", volumeID, currentDiskType, targetDiskType)
+	operationSelfLink, err := gceCS.CloudProvider.ConvertDiskType(ctx, project, volKey, targetDiskType, params.IOPS, params.Throughput)
+	if err != nil {
+		klog.Errorf("Failed to convert volume %s from %s to %s: %v", volumeID, currentDiskType, targetDiskType, err)
+		switch {
+		case isConversionInProgressError(err):
+			// A conversion started by an earlier attempt is still running.
+			return status.Errorf(codes.Unavailable, "conversion of volume %s from %s to %s is in progress", volumeID, currentDiskType, targetDiskType)
+		case isUnsupportedConversionIntentError(err):
+			// Terminal, so stop treating the volume as converting.
+			if clearErr := clearConversionMark(ctx, volKey.Name); clearErr != nil {
+				klog.Errorf("Failed to clear conversion mark for volume %s: %v", volumeID, clearErr)
+			}
+			return status.Errorf(codes.InvalidArgument, "cannot convert volume %s from %s to %s: %v", volumeID, currentDiskType, targetDiskType, err)
+		default:
+			return status.Errorf(codes.Unavailable, "failed to start conversion of volume %s from %s to %s: %v", volumeID, currentDiskType, targetDiskType, err)
+		}
+	}
+
+	// Record the source type now: once the conversion completes the original
+	// type can no longer be read from the disk.
+	if err := setConversionAnnotations(ctx, volKey.Name, map[string]*string{
+		ConversionOperationAnnotation: strPtr(operationSelfLink),
+		ConvertedFromAnnotation:       strPtr(currentDiskType),
+	}); err != nil {
+		klog.Errorf("Failed to record conversion operation for volume %s: %v", volumeID, err)
+	}
+	gceCS.recordConversionStartedEvent(ctx, volKey.Name, currentDiskType, targetDiskType)
+	return nil
 }
 
 // Reasons returned by the convert API that mean the requested conversion can
@@ -1330,6 +1371,16 @@ func (gceCS *GCEControllerServer) executeControllerPublishVolume(ctx context.Con
 	if gceCS.EnableDiskSizeValidation && pubVolResp.GetPublishContext() != nil {
 		pubVolResp.PublishContext[constants.ContextDiskSizeGB] = strconv.FormatInt(disk.GetSizeGb(), 10)
 	}
+
+	// A disk cannot be attached while it is being converted. This is also where
+	// a conversion that finished while no other call was in flight gets its
+	// bookkeeping completed.
+	if gceCS.EnablePdConversion {
+		if err := gceCS.checkConversionBeforeAttach(ctx, volKey.Name, volumeID, disk); err != nil {
+			return nil, err, disk
+		}
+	}
+
 	instance, err := gceCS.CloudProvider.GetInstanceOrError(ctx, project, instanceZone, instanceName)
 	if err != nil {
 		if gce.IsGCENotFoundError(err) {
@@ -1641,6 +1692,11 @@ func (gceCS *GCEControllerServer) executeControllerUnpublishVolume(ctx context.C
 	err = gceCS.CloudProvider.DetachDisk(ctx, project, deviceName, instanceZone, instanceName)
 	if err != nil {
 		return nil, common.LoggedError("Failed to detach: ", err), diskToUnpublish
+	}
+
+	// A conversion that was waiting for this disk to be detached can start now.
+	if gceCS.EnablePdConversion {
+		gceCS.startPendingConversionAfterDetach(ctx, project, volKey, volumeID)
 	}
 
 	klog.V(4).Infof("ControllerUnpublishVolume succeeded for disk %v from node %v", volKey, nodeID)

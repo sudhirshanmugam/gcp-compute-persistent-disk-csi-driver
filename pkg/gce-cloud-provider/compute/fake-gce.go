@@ -85,6 +85,11 @@ type ConversionTestParams struct {
 	TypeConversionTargetType string
 	TypeConversionIops       *int64
 	TypeConversionThroughput *int64
+
+	// Status reported for a previously started conversion operation. Empty
+	// means DONE.
+	OperationStatus string
+	OperationErr    error
 }
 
 var _ GCECompute = &FakeCloudProvider{}
@@ -345,7 +350,7 @@ func (cloud *FakeCloudProvider) DetachDisk(ctx context.Context, project, deviceN
 	return nil
 }
 
-func (cloud *FakeCloudProvider) ConvertDiskType(ctx context.Context, project string, volKey *meta.Key, targetDiskType string, provisionedIops, provisionedThroughput *int64) error {
+func (cloud *FakeCloudProvider) ConvertDiskType(ctx context.Context, project string, volKey *meta.Key, targetDiskType string, provisionedIops, provisionedThroughput *int64) (string, error) {
 	cloud.ConversionTestParams.TypeConversionCalled = true
 	cloud.ConversionTestParams.TypeConversionCallCount++
 	cloud.ConversionTestParams.TypeConversionTargetType = targetDiskType
@@ -353,14 +358,14 @@ func (cloud *FakeCloudProvider) ConvertDiskType(ctx context.Context, project str
 	cloud.ConversionTestParams.TypeConversionThroughput = provisionedThroughput
 
 	if cloud.ConversionTestParams.TypeConversionErr != nil {
-		return cloud.ConversionTestParams.TypeConversionErr
+		return "", cloud.ConversionTestParams.TypeConversionErr
 	}
 
 	// The real API converts asynchronously, but the fake applies the new type
 	// immediately so tests can observe the end state.
 	disk, ok := cloud.disks[volKey.String()]
 	if !ok {
-		return notFoundError()
+		return "", notFoundError()
 	}
 	typeURI := cloud.GetDiskTypeURI(project, volKey, targetDiskType)
 	if disk.disk != nil {
@@ -369,7 +374,18 @@ func (cloud *FakeCloudProvider) ConvertDiskType(ctx context.Context, project str
 	if disk.betaDisk != nil {
 		disk.betaDisk.Type = typeURI
 	}
-	return nil
+	operationSelfLink := fmt.Sprintf("https://www.googleapis.com/compute/alpha/projects/%s/zones/%s/operations/operation-convert-%s", project, volKey.Zone, volKey.Name)
+	return operationSelfLink, nil
+}
+
+func (cloud *FakeCloudProvider) GetConvertDiskOperation(ctx context.Context, operationSelfLink string) (string, error) {
+	if cloud.ConversionTestParams.OperationErr != nil {
+		return cloud.ConversionTestParams.OperationStatus, cloud.ConversionTestParams.OperationErr
+	}
+	if cloud.ConversionTestParams.OperationStatus == "" {
+		return "DONE", nil
+	}
+	return cloud.ConversionTestParams.OperationStatus, nil
 }
 
 func (cloud *FakeCloudProvider) SetDiskAccessMode(ctx context.Context, project string, volKey *meta.Key, accessMode string) error {

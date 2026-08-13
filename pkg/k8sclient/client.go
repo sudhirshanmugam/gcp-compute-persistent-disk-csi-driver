@@ -2,12 +2,14 @@ package k8sclient
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -102,6 +104,85 @@ func getStorageClassWithRetry(ctx context.Context, kubeClient kubernetes.Interfa
 		klog.Errorf("Failed to get StorageClass %s after retries: %v\n", scName, err)
 	}
 	return scObj, err
+}
+
+// PatchPersistentVolumeAnnotations adds, updates or removes annotations on a
+// PersistentVolume. A nil value removes the annotation. A merge patch is used
+// so that annotations written by other components are left alone.
+func PatchPersistentVolumeAnnotations(ctx context.Context, pvName string, annotations map[string]*string) error {
+	if pvName == "" {
+		return fmt.Errorf("persistent volume name is empty")
+	}
+	if len(annotations) == 0 {
+		return nil
+	}
+	kubeClient, err := GetClient()
+	if err != nil {
+		return err
+	}
+	return patchPersistentVolumeAnnotations(ctx, kubeClient, pvName, annotations)
+}
+
+func patchPersistentVolumeAnnotations(ctx context.Context, kubeClient kubernetes.Interface, pvName string, annotations map[string]*string) error {
+	patch, err := json.Marshal(map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"annotations": annotations,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to build annotation patch for PersistentVolume %s: %w", pvName, err)
+	}
+	return wait.ExponentialBackoffWithContext(ctx, backoff, func(_ context.Context) (bool, error) {
+		_, err := kubeClient.CoreV1().PersistentVolumes().Patch(ctx, pvName, types.MergePatchType, patch, metav1.PatchOptions{})
+		if err != nil {
+			klog.Warningf("Error patching PersistentVolume %s annotations: %v, retrying...\n", pvName, err)
+			return false, nil
+		}
+		klog.V(4).Infof("Successfully patched PersistentVolume %s annotations\n", pvName)
+		return true, nil
+	})
+}
+
+// CreateEvent records a Kubernetes event. Events are best effort reporting, so
+// this does not retry.
+func CreateEvent(ctx context.Context, event *v1.Event) error {
+	kubeClient, err := GetClient()
+	if err != nil {
+		return err
+	}
+	namespace := event.Namespace
+	if namespace == "" {
+		namespace = metav1.NamespaceDefault
+	}
+	_, err = kubeClient.CoreV1().Events(namespace).Create(ctx, event, metav1.CreateOptions{})
+	return err
+}
+
+// GetVolumeAttributesClassParameters returns the parameters of a
+// VolumeAttributesClass. The resource is served at v1 on newer clusters and at
+// v1beta1 on older ones, so both are tried.
+func GetVolumeAttributesClassParameters(ctx context.Context, vacName string) (map[string]string, error) {
+	if vacName == "" {
+		return nil, fmt.Errorf("volume attributes class name is empty")
+	}
+	kubeClient, err := GetClient()
+	if err != nil {
+		return nil, err
+	}
+	return getVolumeAttributesClassParameters(ctx, kubeClient, vacName)
+}
+
+func getVolumeAttributesClassParameters(ctx context.Context, kubeClient kubernetes.Interface, vacName string) (map[string]string, error) {
+	vac, err := kubeClient.StorageV1().VolumeAttributesClasses().Get(ctx, vacName, metav1.GetOptions{})
+	if err == nil {
+		return vac.Parameters, nil
+	}
+	klog.V(5).Infof("Could not get VolumeAttributesClass %s at v1 (%v), trying v1beta1\n", vacName, err)
+	betaVac, betaErr := kubeClient.StorageV1beta1().VolumeAttributesClasses().Get(ctx, vacName, metav1.GetOptions{})
+	if betaErr != nil {
+		return nil, fmt.Errorf("failed to get VolumeAttributesClass %s: %w", vacName, betaErr)
+	}
+	return betaVac.Parameters, nil
 }
 
 func getPersistentVolumeWithRetry(ctx context.Context, kubeClient kubernetes.Interface, pvName string) (*v1.PersistentVolume, error) {

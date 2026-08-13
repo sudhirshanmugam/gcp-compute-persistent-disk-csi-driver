@@ -118,7 +118,8 @@ type GCECompute interface {
 	AttachDisk(ctx context.Context, project string, volKey *meta.Key, readWrite, diskType, instanceZone, instanceName string, forceAttach bool) error
 	DetachDisk(ctx context.Context, project, deviceName, instanceZone, instanceName string) error
 	ConvertDisk(ctx context.Context, project string, volKey *meta.Key, instanceName, instanceZone string, quickConversionOnly bool) error
-	ConvertDiskType(ctx context.Context, project string, volKey *meta.Key, targetDiskType string, provisionedIops, provisionedThroughput *int64) error
+	ConvertDiskType(ctx context.Context, project string, volKey *meta.Key, targetDiskType string, provisionedIops, provisionedThroughput *int64) (string, error)
+	GetConvertDiskOperation(ctx context.Context, operationSelfLink string) (string, error)
 	SetDiskAccessMode(ctx context.Context, project string, volKey *meta.Key, accessMode string) error
 	SetDiskLabels(ctx context.Context, project string, volKey *meta.Key, disk *CloudDisk, labels map[string]string) error
 	ListCompatibleDiskTypeZones(ctx context.Context, project string, zones []string, diskType string) ([]string, error)
@@ -996,11 +997,13 @@ func (cloud *CloudProvider) ConvertDisk(ctx context.Context, project string, vol
 // created with. The disk keeps its name and self link.
 //
 // Conversion can take from minutes to hours depending on disk size, so this
-// only starts the operation and returns as soon as the API accepts it. Callers
-// observe completion by re-reading the disk's type on a later reconcile.
-func (cloud *CloudProvider) ConvertDiskType(ctx context.Context, project string, volKey *meta.Key, targetDiskType string, provisionedIops, provisionedThroughput *int64) error {
+// only starts the operation and returns as soon as the API accepts it. The self
+// link of the started operation is returned so that callers can record it and
+// check on it later. Callers observe completion by re-reading the disk's type
+// on a later reconcile.
+func (cloud *CloudProvider) ConvertDiskType(ctx context.Context, project string, volKey *meta.Key, targetDiskType string, provisionedIops, provisionedThroughput *int64) (string, error) {
 	if volKey.Type() != meta.Zonal {
-		return fmt.Errorf("disk type conversion is not supported for regional disk %s", volKey.Name)
+		return "", fmt.Errorf("disk type conversion is not supported for regional disk %s", volKey.Name)
 	}
 	klog.V(5).Infof("Converting disk %v in zone %v to type %s", volKey.Name, volKey.Zone, targetDiskType)
 
@@ -1018,10 +1021,51 @@ func (cloud *CloudProvider) ConvertDiskType(ctx context.Context, project string,
 
 	op, err := cloud.alphaService.Disks.Convert(project, volKey.Zone, volKey.Name, &computealpha.DisksConvertRequest{Params: params}).Context(ctx).Do()
 	if err != nil {
-		return err
+		return "", err
 	}
 	klog.V(4).Infof("Started convert operation %s for disk %s to type %s", op.Name, volKey.Name, targetDiskType)
-	return nil
+	return op.SelfLink, nil
+}
+
+// GetConvertDiskOperation returns the status of a previously started conversion
+// operation, identified by the self link recorded when it was started, together
+// with the error the operation failed with, if any. The status is one of
+// PENDING, RUNNING or DONE.
+func (cloud *CloudProvider) GetConvertDiskOperation(ctx context.Context, operationSelfLink string) (string, error) {
+	project, zone, name, err := parseZonalOperationSelfLink(operationSelfLink)
+	if err != nil {
+		return "", err
+	}
+	op, err := cloud.alphaService.ZoneOperations.Get(project, zone, name).Context(ctx).Do()
+	if err != nil {
+		return "", fmt.Errorf("failed to get conversion operation %s: %w", operationSelfLink, err)
+	}
+	if op.Error != nil && len(op.Error.Errors) > 0 {
+		return op.Status, fmt.Errorf("conversion operation %s failed: %s", name, op.Error.Errors[0].Message)
+	}
+	return op.Status, nil
+}
+
+// parseZonalOperationSelfLink pulls the project, zone and operation name out of
+// a zonal operation self link, which looks like
+// https://www.googleapis.com/compute/alpha/projects/p/zones/z/operations/op.
+func parseZonalOperationSelfLink(selfLink string) (string, string, string, error) {
+	parts := strings.Split(strings.TrimSuffix(selfLink, "/"), "/")
+	project, zone, name := "", "", ""
+	for i := 0; i < len(parts)-1; i++ {
+		switch parts[i] {
+		case "projects":
+			project = parts[i+1]
+		case "zones":
+			zone = parts[i+1]
+		case "operations":
+			name = parts[i+1]
+		}
+	}
+	if project == "" || zone == "" || name == "" {
+		return "", "", "", fmt.Errorf("could not parse zonal operation self link %q", selfLink)
+	}
+	return project, zone, name, nil
 }
 
 func (cloud *CloudProvider) SetDiskAccessMode(ctx context.Context, project string, volKey *meta.Key, accessMode string) error {
