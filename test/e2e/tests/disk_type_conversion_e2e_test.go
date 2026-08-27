@@ -43,24 +43,6 @@ const (
 	diskTypeHyperdiskBalanced = "hyperdisk-balanced"
 )
 
-// waitForModifyVolumeToComplete retries a ControllerModifyVolume call until it
-// reports the modification complete. Starting a disk type conversion is
-// asynchronous on GCE's side, so a successful start is reported back as a
-// retryable Unavailable error until the disk actually reaches the requested
-// state; any other error is treated as terminal.
-func waitForModifyVolumeToComplete(modify func() error) error {
-	return wait.PollUntilContextTimeout(context.Background(), 10*time.Second, 15*time.Minute, true, func(ctx context.Context) (bool, error) {
-		err := modify()
-		if err == nil {
-			return true, nil
-		}
-		if grpcStatus, ok := status.FromError(err); ok && grpcStatus.Code() == codes.Unavailable {
-			return false, nil
-		}
-		return false, err
-	})
-}
-
 var _ = Describe("GCE PD CSI Driver VolumeAttributesClass & Disk Conversion", func() {
 
 	It("Should dynamically modify IOPS and throughput on hyperdisk-balanced without triggering conversion", func() {
@@ -200,13 +182,8 @@ var _ = Describe("GCE PD CSI Driver VolumeAttributesClass & Disk Conversion", fu
 			"type": diskTypeHyperdiskBalanced,
 		}
 
-		// Starting a conversion returns a retryable Unavailable error until GCE
-		// finishes it, so this polls ControllerModifyVolume rather than treating
-		// the first call's error as failure.
-		err = waitForModifyVolumeToComplete(func() error {
-			return client.ControllerModifyVolume(volume.VolumeId, convertParams)
-		})
-		Expect(err).To(BeNil(), "ControllerModifyVolume did not complete the conversion")
+		err = client.ControllerModifyVolume(volume.VolumeId, convertParams)
+		Expect(err).To(BeNil(), "ControllerModifyVolume failed to initiate conversion")
 
 		err = client.ControllerPublishVolumeReadWrite(volume.VolumeId, instance.GetNodeID(), false /* forceAttach */)
 		Expect(err).NotTo(BeNil(), "ControllerPublishVolumeReadWrite should have been blocked during conversion")
@@ -329,13 +306,8 @@ var _ = Describe("GCE PD CSI Driver Dynamic Volumes VAC Conversion", func() {
 			"iops":       "3000",
 			"throughput": "140Mi",
 		}
-		// Starting a conversion returns a retryable Unavailable error until GCE
-		// finishes it, so this polls ControllerModifyVolume rather than treating
-		// the first call's error as failure.
-		err = waitForModifyVolumeToComplete(func() error {
-			return client.ControllerModifyVolume(volume.VolumeId, convertParams)
-		})
-		Expect(err).To(BeNil(), "ControllerModifyVolume did not complete the conversion")
+		err = client.ControllerModifyVolume(volume.VolumeId, convertParams)
+		Expect(err).To(BeNil(), "ControllerModifyVolume failed to initiate conversion")
 
 		By("3. Wait for the GCE disk to finish conversion")
 		err = wait.PollUntilContextTimeout(context.Background(), 10*time.Second, 15*time.Minute, true, func(ctx context.Context) (bool, error) {
@@ -452,13 +424,8 @@ var _ = Describe("GCE PD CSI Driver Dynamic Volumes VAC Conversion", func() {
 			"iops":       "3000",
 			"throughput": "140Mi",
 		}
-		// Starting a conversion returns a retryable Unavailable error until GCE
-		// finishes it, so this polls ControllerModifyVolume rather than treating
-		// the first call's error as failure.
-		err = waitForModifyVolumeToComplete(func() error {
-			return client.ControllerModifyVolume(volume.VolumeId, convertParams)
-		})
-		Expect(err).To(BeNil(), "ControllerModifyVolume did not complete the conversion")
+		err = client.ControllerModifyVolume(volume.VolumeId, convertParams)
+		Expect(err).To(BeNil(), "ControllerModifyVolume failed to initiate conversion")
 
 		By("4. Detach the workload to allow conversion to complete")
 		err = client.NodeUnpublishVolume(volume.VolumeId, publishDir)
@@ -548,13 +515,8 @@ var _ = Describe("GCE PD CSI Driver Dynamic Volumes VAC Conversion", func() {
 			"iops":       "3000",
 			"throughput": "140Mi",
 		}
-		// Starting a conversion returns a retryable Unavailable error until GCE
-		// finishes it, so this polls ControllerModifyVolume rather than treating
-		// the first call's error as failure.
-		err = waitForModifyVolumeToComplete(func() error {
-			return client.ControllerModifyVolume(volume.VolumeId, convertParams)
-		})
-		Expect(err).To(BeNil(), "ControllerModifyVolume did not complete the conversion")
+		err = client.ControllerModifyVolume(volume.VolumeId, convertParams)
+		Expect(err).To(BeNil(), "ControllerModifyVolume failed to initiate conversion")
 
 		By("3. Verify attachment is rejected while a conversion is in progress")
 		err = client.ControllerPublishVolumeReadWrite(volume.VolumeId, instance.GetNodeID(), false)
