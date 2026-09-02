@@ -26,7 +26,7 @@ import (
 	"k8s.io/klog/v2"
 )
 
-func (i *InstanceInfo) UploadAndRun(archivePath, remoteWorkspace, driverRunCmd string) (int, error) {
+func (i *InstanceInfo) UploadAndRun(archivePath, remoteWorkspace, driverRunCmd string, extraFiles map[string]string) (int, error) {
 
 	// Create the temp staging directory
 	klog.V(4).Infof("Staging test binaries on %q", i.cfg.Name)
@@ -35,6 +35,15 @@ func (i *InstanceInfo) UploadAndRun(archivePath, remoteWorkspace, driverRunCmd s
 	if output, err := i.SSHNoSudo("mkdir", remoteWorkspace); err != nil {
 		// Exit failure with the error
 		return -1, fmt.Errorf("failed to create remoteWorkspace directory %q on instance %q: %v output: %q", remoteWorkspace, i.cfg.Name, err.Error(), output)
+	}
+
+	// Copy any extra files (e.g. a kubeconfig) into the workspace before the
+	// driver starts, since it may need them as soon as it comes up.
+	for localPath, remoteName := range extraFiles {
+		dest := fmt.Sprintf("%s:%s/%s", i.GetSSHTarget(), remoteWorkspace, remoteName)
+		if output, err := runSSHCommand("scp", localPath, dest); err != nil {
+			return -1, fmt.Errorf("failed to copy extra file %q to %q: %v, output: %q", localPath, dest, err.Error(), output)
+		}
 	}
 
 	// Copy the archive to the staging directory

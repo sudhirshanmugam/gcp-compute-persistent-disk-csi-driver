@@ -48,6 +48,12 @@ type DriverConfig struct {
 	ComputeEndpoint string
 	ExtraFlags      []string
 	Zones           []string
+	// ConversionKubeconfig, if set, is the local path to a kubeconfig for a
+	// real cluster. It's copied onto the test instance and the driver is
+	// started with KUBECONFIG pointed at it, so k8sclient.GetClient can reach
+	// a real Kubernetes API instead of failing the in-cluster config lookup
+	// that a bare test VM can never satisfy.
+	ConversionKubeconfig string
 }
 
 func GCEClientAndDriverSetup(instance *remote.InstanceInfo, driverConfig DriverConfig) (*remote.TestContext, error) {
@@ -84,16 +90,27 @@ func GCEClientAndDriverSetup(instance *remote.InstanceInfo, driverConfig DriverC
 	extra_flags = append(extra_flags, driverConfig.ExtraFlags...)
 
 	workspace := remote.NewWorkspaceDir("gce-pd-e2e-")
+
+	// When a real cluster's kubeconfig is provided, it's copied into the
+	// workspace and exported so the driver can reach a real Kubernetes API.
+	envPrefix := ""
+	extraFiles := map[string]string{}
+	if driverConfig.ConversionKubeconfig != "" {
+		extraFiles[driverConfig.ConversionKubeconfig] = "kubeconfig"
+		envPrefix = fmt.Sprintf("KUBECONFIG=%s/kubeconfig ", workspace)
+	}
+
 	// Log at V(6) as the compute API calls are emitted at that level and it's
 	// useful to see what's happening when debugging tests.
-	driverRunCmd := fmt.Sprintf("sh -c '/usr/bin/nohup %s/gce-pd-csi-driver -v=6 --endpoint=%s %s 2> %s/prog.out < /dev/null > /dev/null &'",
-		workspace, endpoint, strings.Join(extra_flags, " "), workspace)
+	driverRunCmd := fmt.Sprintf("sh -c '%s/usr/bin/nohup %s/gce-pd-csi-driver -v=6 --endpoint=%s %s 2> %s/prog.out < /dev/null > /dev/null &'",
+		envPrefix, workspace, endpoint, strings.Join(extra_flags, " "), workspace)
 	config := &remote.ClientConfig{
 		PkgPath:      pkgPath,
 		BinPath:      binPath,
 		WorkspaceDir: workspace,
 		RunDriverCmd: driverRunCmd,
 		Port:         port,
+		ExtraFiles:   extraFiles,
 	}
 
 	err := os.Setenv("GCE_PD_CSI_STAGING_VERSION", "latest")

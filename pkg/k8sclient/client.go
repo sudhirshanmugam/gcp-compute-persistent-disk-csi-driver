@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -14,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 )
 
@@ -29,7 +31,19 @@ var (
 	}
 
 	// For testing purposes, this function can be overridden to return a fake client.
+	//
+	// KUBECONFIG is checked first so out-of-cluster harnesses (the driver
+	// running as a bare process outside any pod, as in test/e2e) can point it
+	// at a real cluster. Production deployments never set this env var, so
+	// they always fall through to the in-cluster config exactly as before.
 	GetClient = func() (kubernetes.Interface, error) {
+		if kubeconfig := os.Getenv("KUBECONFIG"); kubeconfig != "" {
+			cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+			if err != nil {
+				return nil, err
+			}
+			return kubernetes.NewForConfig(cfg)
+		}
 		cfg, err := rest.InClusterConfig()
 		if err != nil {
 			return nil, err

@@ -65,6 +65,12 @@ var (
 	// Some architectures don't have local ssd. Give way to opt out of tests like datacache.
 	skipLocalSsdTests = flag.Bool("skip-local-ssd-tests", false, "Skip local ssd tests like datacache")
 
+	// Path to a kubeconfig for a real cluster the driver can use for the
+	// PV-annotation-backed disk-type conversion tracking (checkNoConversionInProgress
+	// and friends). Without this, --enable-pd-conversion tests can't reach a
+	// Kubernetes API from this bare-VM harness.
+	conversionKubeconfig = flag.String("conversion-kubeconfig", "", "Path to a kubeconfig for a real cluster, used so the driver can reach a Kubernetes API for disk type conversion tracking")
+
 	testContexts          []*remote.TestContext
 	hyperdiskTestContexts []*remote.TestContext
 	computeService        *compute.Service
@@ -111,6 +117,11 @@ var _ = BeforeSuite(func() {
 	Expect(*serviceAccount).ToNot(BeEmpty(), "Service account should not be empty")
 
 	klog.Infof("Running in project %v with service account %v", *project, *serviceAccount)
+
+	// Must exist before any driver process starts: the driver's local-SSD
+	// device-cache setup looks up a Node named constants.TestNode at startup
+	// and retries for ~30s per instance if it's missing.
+	Expect(createConversionNode()).To(BeNil(), "Failed to create conversion-tracking Node")
 
 	testContexts = make([]*remote.TestContext, numberOfInstancesPerZone*len(zones))
 	if *hdMachineType != noMachineType {
@@ -163,6 +174,7 @@ var _ = AfterSuite(func() {
 			mwTc.Instance.DeleteInstance()
 		}
 	}
+	deleteConversionNode()
 })
 
 func notEmpty(v string) bool {
@@ -171,8 +183,9 @@ func notEmpty(v string) bool {
 
 func getDriverConfig() testutils.DriverConfig {
 	return testutils.DriverConfig{
-		ExtraFlags: slices.Filter(nil, strings.Split(*extraDriverFlags, ","), notEmpty),
-		Zones:      strings.Split(*zones, ","),
+		ExtraFlags:           slices.Filter(nil, strings.Split(*extraDriverFlags, ","), notEmpty),
+		Zones:                strings.Split(*zones, ","),
+		ConversionKubeconfig: *conversionKubeconfig,
 	}
 }
 

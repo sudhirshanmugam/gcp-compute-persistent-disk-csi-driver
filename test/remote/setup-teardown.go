@@ -45,6 +45,10 @@ type ClientConfig struct {
 	RunDriverCmd string
 	// Port to use as SSH tunnel on both remote and local side.
 	Port string
+	// ExtraFiles maps local file paths to the filename they should be copied
+	// to inside the remote workspace directory, before the driver is
+	// started. Optional.
+	ExtraFiles map[string]string
 }
 
 type processes struct {
@@ -90,7 +94,7 @@ func SetupNewDriverAndClient(instance *InstanceInfo, config *ClientConfig) (*Tes
 	}
 
 	// Upload archive to instance and run binaries
-	driverPID, err := instance.UploadAndRun(archivePath, config.WorkspaceDir, config.RunDriverCmd)
+	driverPID, err := instance.UploadAndRun(archivePath, config.WorkspaceDir, config.RunDriverCmd, config.ExtraFiles)
 	if err != nil {
 		return nil, fmt.Errorf("failed to upload and run driver: %v", err.Error())
 	}
