@@ -16,14 +16,18 @@ package gcecloudprovider
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/GoogleCloudPlatform/k8s-cloud-provider/pkg/cloud/meta"
 	computebeta "google.golang.org/api/compute/v0.beta"
 	"google.golang.org/api/compute/v1"
 	computev1 "google.golang.org/api/compute/v1"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/constants"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/parameters"
@@ -473,6 +477,16 @@ func TestCodeForGCEOpError(t *testing.T) {
 			inputErr: computev1.OperationErrorErrors{Code: "RESOURCE_OPERATION_RATE_EXCEEDED"},
 			expCode:  codes.ResourceExhausted,
 		},
+		{
+			name:     "EXTERNAL_RESOURCE_NOT_FOUND error",
+			inputErr: computev1.OperationErrorErrors{Code: "EXTERNAL_RESOURCE_NOT_FOUND"},
+			expCode:  codes.FailedPrecondition,
+		},
+		{
+			name:     "unmapped error defaults to Internal",
+			inputErr: computev1.OperationErrorErrors{Code: "SOME_UNKNOWN_ERROR"},
+			expCode:  codes.Internal,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -481,6 +495,87 @@ func TestCodeForGCEOpError(t *testing.T) {
 		if errCode != tc.expCode {
 			t.Errorf("test %v failed: got %v, expected %v", tc.name, errCode, tc.expCode)
 		}
+	}
+}
+
+func TestWrapOpErr(t *testing.T) {
+	const opName = "operation-1234"
+	testCases := []struct {
+		name            string
+		inputErr        *computev1.OperationErrorErrors
+		expNil          bool
+		expUnsupported  bool
+		expCode         codes.Code
+		expMsgSubstring []string
+	}{
+		{
+			name:   "nil operation error",
+			expNil: true,
+		},
+		{
+			name: "EXTERNAL_RESOURCE_NOT_FOUND for deleted service account",
+			inputErr: &computev1.OperationErrorErrors{
+				Code:    "EXTERNAL_RESOURCE_NOT_FOUND",
+				Message: "The resource 'sa@project.iam.gserviceaccount.com' of type 'serviceAccount' was not found.",
+			},
+			expCode: codes.FailedPrecondition,
+			expMsgSubstring: []string{
+				opName,
+				"EXTERNAL_RESOURCE_NOT_FOUND",
+				"The resource 'sa@project.iam.gserviceaccount.com' of type 'serviceAccount' was not found.",
+			},
+		},
+		{
+			name: "unmapped error code defaults to Internal",
+			inputErr: &computev1.OperationErrorErrors{
+				Code:    "SOME_UNKNOWN_ERROR",
+				Message: "something went wrong",
+			},
+			expCode:         codes.Internal,
+			expMsgSubstring: []string{opName, "SOME_UNKNOWN_ERROR", "something went wrong"},
+		},
+		{
+			name: "UNSUPPORTED_OPERATION with disk type returns UnsupportedDiskError",
+			inputErr: &computev1.OperationErrorErrors{
+				Code:    "UNSUPPORTED_OPERATION",
+				Message: "[pd-standard] features are not compatible for creating instance.",
+			},
+			expUnsupported: true,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := wrapOpErr(opName, tc.inputErr)
+			if tc.expNil {
+				if err != nil {
+					t.Fatalf("expected nil error, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected an error, got nil")
+			}
+			if tc.expUnsupported {
+				var udErr *UnsupportedDiskError
+				if !errors.As(err, &udErr) {
+					t.Fatalf("expected *UnsupportedDiskError, got %T: %v", err, err)
+				}
+				return
+			}
+			st, ok := status.FromError(err)
+			if !ok {
+				t.Fatalf("expected a gRPC status error, got %T: %v", err, err)
+			}
+			if st.Code() != tc.expCode {
+				t.Errorf("got code %v, expected %v", st.Code(), tc.expCode)
+			}
+			for _, s := range tc.expMsgSubstring {
+				if !strings.Contains(st.Message(), s) {
+					t.Errorf("message %q does not contain %q", st.Message(), s)
+				}
+			}
+		})
 	}
 }
 
@@ -596,5 +691,82 @@ func TestRepairUnderspecifiedVolumeKey(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestUpdateDiskError(t *testing.T) {
+	volKey := meta.ZonalKey("test-disk", "us-central1-a")
+	withErrorInfo := func(code int, topLevel, detail string) error {
+		return &googleapi.Error{
+			Code:    code,
+			Message: "update failed",
+			Errors:  []googleapi.ErrorItem{{Reason: topLevel}},
+			Details: []interface{}{map[string]interface{}{
+				"@type":  "type.googleapis.com/google.rpc.ErrorInfo",
+				"reason": detail,
+			}},
+		}
+	}
+	testCases := []struct {
+		name    string
+		err     error
+		expCode codes.Code
+	}{
+		{
+			name:    "a value GCE rejects is infeasible",
+			err:     &googleapi.Error{Code: 400, Errors: []googleapi.ErrorItem{{Reason: "invalid"}}},
+			expCode: codes.InvalidArgument,
+		},
+		{
+			name:    "a generic bad request with nothing more specific is infeasible",
+			err:     &googleapi.Error{Code: 400, Errors: []googleapi.ErrorItem{{Reason: "badRequest"}}},
+			expCode: codes.InvalidArgument,
+		},
+		{
+			// The Hyperdisk cooldown between performance changes arrives as a
+			// 400 whose only top level reason is badRequest.
+			name:    "a rate limit behind a generic bad request is retried",
+			err:     withErrorInfo(400, "badRequest", "RESOURCE_OPERATION_RATE_EXCEEDED"),
+			expCode: codes.Unavailable,
+		},
+		{
+			name:    "a quota limit is retried",
+			err:     withErrorInfo(403, "forbidden", "QUOTA_EXCEEDED"),
+			expCode: codes.Unavailable,
+		},
+		{
+			name:    "a top level rate limit is retried",
+			err:     &googleapi.Error{Code: 429, Errors: []googleapi.ErrorItem{{Reason: "rateLimitExceeded"}}},
+			expCode: codes.Unavailable,
+		},
+		{
+			name:    "an error that is not from the API is retried",
+			err:     errors.New("connection reset by peer"),
+			expCode: codes.Unavailable,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := status.Code(updateDiskError(volKey, tc.err)); got != tc.expCode {
+				t.Errorf("updateDiskError(%v) code = %v; want %v", tc.err, got, tc.expCode)
+			}
+		})
+	}
+}
+
+func TestGCEErrorReasonPrefersErrorInfo(t *testing.T) {
+	err := fmt.Errorf("wrapped: %w", &googleapi.Error{
+		Code:    400,
+		Errors:  []googleapi.ErrorItem{{Reason: "badRequest"}},
+		Details: []interface{}{map[string]interface{}{"reason": "RESOURCE_OPERATION_RATE_EXCEEDED"}},
+	})
+	if got := GCEErrorReason(err); got != "RESOURCE_OPERATION_RATE_EXCEEDED" {
+		t.Errorf("GCEErrorReason = %q; want the ErrorInfo reason", got)
+	}
+	if got := GCEErrorReason(&googleapi.Error{Code: 400, Errors: []googleapi.ErrorItem{{Reason: "badRequest"}}}); got != "badRequest" {
+		t.Errorf("GCEErrorReason = %q; want the top level reason when there is no ErrorInfo", got)
+	}
+	if got := GCEErrorReason(errors.New("not an API error")); got != "" {
+		t.Errorf("GCEErrorReason = %q; want empty for a non-API error", got)
 	}
 }

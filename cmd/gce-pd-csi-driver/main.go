@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,6 +37,7 @@ import (
 	gce "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/compute"
 	metadataservice "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/metadata"
 	driver "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-pd-csi-driver"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/k8sclient"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/linkcache"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/metrics"
 	mountmanager "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/mount-manager"
@@ -89,8 +91,10 @@ var (
 	enableStoragePoolsFlag      = flag.Bool("enable-storage-pools", false, "If set to true, the CSI Driver will allow volumes to be provisioned in Storage Pools")
 	enableHdHAFlag              = flag.Bool("allow-hdha-provisioning", false, "If set to true, will allow the driver to provision Hyperdisk-balanced High Availability disks")
 	enableDataCacheFlag         = flag.Bool("enable-data-cache", false, "If set to true, the CSI Driver will allow volumes to be provisioned with Data Cache configuration")
+	enableNonK8sDataCacheIfSSDs = flag.Bool("enable-non-k8s-data-cache-if-ssds", false, "If set to true, enable data cache when not running on in k8s if the node has SSDs")
 	enableMultitenancyFlag      = flag.Bool("enable-multitenancy", false, "If set to true, the CSI Driver will support running on multitenant GKE clusters")
 	enablePdConversion          = flag.Bool("enable-pd-conversion", false, "If set to true, the CSI Driver will attempt to convert eligible PD disks to be compatible with attaching machine types during the attach operation")
+	enableDiskTypeConversion    = flag.Bool("enable-disk-type-conversion", false, "If set to true, the CSI Driver will convert a disk to the type its VolumeAttributesClass asks for, such as from a Persistent Disk type to a Hyperdisk type")
 	nodeName                    = flag.String("node-name", "", "The node this driver is running on")
 
 	multiZoneVolumeHandleDiskTypesFlag = flag.String("multi-zone-volume-handle-disk-types", "", "Comma separated list of allowed disk types that can use the multi-zone volumeHandle. Used only if --multi-zone-volume-handle-enable")
@@ -125,6 +129,10 @@ var (
 	runTaintWebhook    = flag.Bool("run-taint-webhook", false, "Enables the Mutating Admission Webhook (adds startup taints to Nodes to delay workloads until the CSINode resource is created)")
 	webhookPort        = flag.Int("webhook-port", 9443, "The port for the admission webhook to listen on")
 	taintMetricsAddr   = flag.String("taint-metrics-addr", ":8081", "The address the taint controller metrics endpoint binds to.")
+
+	enableNodeReadinessCondition = flag.Bool("enable-node-readiness-condition", false, "If set to true, the node driver sets the --node-readiness-condition-type condition to True on its Node once csi-driver-registrar is healthy.")
+	nodeReadinessConditionType   = flag.String("node-readiness-condition-type", "pd.csi.storage.gke.io/Ready", "The Node condition type set when --enable-node-readiness-condition is true.")
+	registrarHealthzEndpoint     = flag.String("registrar-healthz-endpoint", "127.0.0.1:9931", "The host:port of the csi-driver-registrar healthz endpoint polled by the node readiness reporter.")
 
 	version string
 )
@@ -299,6 +307,7 @@ func handle() {
 			EnableDynamicVolumes:     *dynamicVolumes,
 			EnableGCEDiskStatus:      *gceDiskStatus,
 			EnablePdConversion:       *enablePdConversion,
+			EnableDiskTypeConversion: *enableDiskTypeConversion,
 			ClusterOwnershipID:       *clusterOwnershipID,
 		}
 
@@ -326,12 +335,20 @@ func handle() {
 
 		deviceUtils := deviceutils.NewDeviceUtils()
 		statter := mountmanager.NewStatter(mounter)
-		meta, err := metadataservice.NewMetadataService()
+		meta, err := metadataservice.NewMetadataService(ctx)
 		if err != nil {
 			klog.Fatalf("Failed to set up metadata service: %v", err.Error())
 		}
 		isDataCacheEnabledNodePool, err := driver.IsDataCacheEnabledNodePool(ctx, *nodeName, *enableDataCacheFlag)
-		if err != nil {
+		if *enableNonK8sDataCacheIfSSDs && (*nodeName == "" || errors.Is(err, k8sclient.NoKubernetesError)) {
+			klog.Warningf("Datacache enabled for non-k8s, will get datacache node pool information from metadata server")
+			if getLocalSsdFromMetadata(ctx, meta) > 0 {
+				klog.Infof("Have ssds reported in metadata, treating like datacache node pool")
+				isDataCacheEnabledNodePool = true
+			} else {
+				klog.Infof("No ssds reported, treating like not a datacache node pool")
+			}
+		} else if err != nil {
 			klog.Fatalf("Failed to get node info from API server: %v", err.Error())
 		}
 
@@ -359,16 +376,26 @@ func handle() {
 		if *maxConcurrentFormatAndMount > 0 {
 			nodeServer = nodeServer.WithSerializedFormatAndMount(*formatAndMountTimeout, *maxConcurrentFormatAndMount)
 		}
+		klog.Infof("Data Cache driver enabled: %t. Node enabled: %t", *enableDataCacheFlag, nsArgs.DataCacheEnabledNodePool)
 		if *enableDataCacheFlag {
-			if nodeName == nil || *nodeName == "" {
-				klog.Errorf("Data Cache enabled, but --node-name not passed")
-			}
 			if nsArgs.DataCacheEnabledNodePool {
-				if err := setupDataCache(ctx, *nodeName, nodeServer.MetadataService.GetName()); err != nil {
+				if err := setupDataCache(ctx, meta, *nodeName, nodeServer.MetadataService.GetName()); err != nil {
 					klog.Errorf("Data Cache setup failed: %v", err)
 				}
 				go driver.StartWatcher(ctx, *nodeName)
 			}
+		}
+
+		if *enableNodeReadinessCondition {
+			kubeClient, err := k8sclient.GetClient()
+			if err != nil {
+				klog.Fatalf("Failed to create k8s client for node readiness reporter: %v", err.Error())
+			}
+			reporter, err := driver.NewNodeReadinessReporter(*nodeName, *nodeReadinessConditionType, *registrarHealthzEndpoint, kubeClient)
+			if err != nil {
+				klog.Fatalf("Failed to create node readiness reporter: %v", err.Error())
+			}
+			go reporter.Run(ctx)
 		}
 
 	}
@@ -484,7 +511,22 @@ func fetchLssdsForRaiding(lssdCount int) ([]string, error) {
 	return availableLssds[:lssdCount], nil
 }
 
-func setupDataCache(ctx context.Context, nodeName string, nodeId string) error {
+func getLocalSsdFromMetadata(ctx context.Context, meta metadataservice.MetadataService) int {
+	ssdStr, err := meta.GetValue(ctx, constants.DatacacheLocalSsdMetadataLabel)
+	if err != nil {
+		klog.Warningf("Could not fetch %s, assuming no local ssd: %v", constants.DatacacheLocalSsdMetadataLabel, err)
+		return 0
+	}
+	ssdCount, err := strconv.Atoi(ssdStr)
+	if err != nil {
+		klog.Warningf("Could not parse %s value, assuming no local ssd; value: %s; err: %v", constants.DatacacheLocalSsdMetadataLabel, ssdStr, err)
+		return 0
+	}
+	return ssdCount
+}
+
+func setupDataCache(ctx context.Context, meta metadataservice.MetadataService, nodeName string, nodeId string) error {
+	klog.V(4).Infof("Setting up data cache on %s", nodeName)
 	isAlreadyRaided, err := driver.IsRaided()
 	if err != nil {
 		klog.V(4).Infof("Errored while scanning for available LocalSSDs err:%v; continuing Raiding", err)
@@ -493,18 +535,21 @@ func setupDataCache(ctx context.Context, nodeName string, nodeId string) error {
 		return nil
 	}
 
-	lssdCount := constants.LocalSSDCountForDataCache
-	if nodeName != constants.TestNode {
-		var err error
+	var lssdCount int
+	if nodeName != "" {
 		lssdCount, err = driver.GetDataCacheCountFromNodeLabel(ctx, nodeName)
-		if err != nil {
-			return err
-		}
-		if lssdCount == 0 {
-			klog.V(4).Infof("Data Cache is not enabled on node %v, so skipping caching setup", nodeName)
-			return nil
-		}
 	}
+	if nodeName == "" || errors.Is(err, k8sclient.NoKubernetesError) {
+		klog.V(4).Infof("No kubernetes, will get local ssd count from card list (error: %v)", err)
+		lssdCount = getLocalSsdFromMetadata(ctx, meta)
+	} else if err != nil {
+		return err
+	}
+	if lssdCount == 0 {
+		klog.V(4).Infof("No ssds found on node %v, skipping data cache setup", nodeName)
+		return nil
+	}
+
 	lssdNames, err := fetchLssdsForRaiding(lssdCount)
 	if err != nil {
 		klog.Fatalf("Failed to get sufficient SSDs for Data Cache's caching setup: %v", err)

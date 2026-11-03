@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -32,23 +33,125 @@ const (
 var (
 	maxChunkSize float64 = 1 * GiB   // Max allowed chunk size as per LVM documentation
 	minChunkSize float64 = 160 * KiB // This is randomly selected, we need a multiple of 32KiB, the default size would be too small for caching https://man7.org/linux/man-pages/man8/lvcreate.8.html (--chunksize)
+	// mdadmRunDir is mdadm's runtime state directory (MAP_DIR). mdadm >= 4.3
+	// (shipped with Debian trixie) writes a "creating-<md>" udev-blocking file
+	// into this directory during `mdadm --create` and fails with
+	// "Cannot block udev, error creating blocking file" if the directory does
+	// not exist. The driver image is distroless and does not ship /run/mdadm,
+	// so the driver has to create it before invoking mdadm.
+	mdadmRunDir = "/run/mdadm"
 )
 
-func fetchRAIDedLocalSsdPath() (string, error) {
-	args := []string{
-		"--detail",
-		"--scan",
-	}
-	info, err := common.RunCommand("grep", []string{raidedLocalSsdName}, "mdadm", args...)
-	if err != nil || len(info) == 0 {
-		return "", fmt.Errorf("Error getting RAIDed device path for Data Cache %v, output:%v", err, string(info))
-	}
-	infoString := strings.TrimSpace(string(info))
-	infoSlice := strings.Fields(infoString)
+// runMdadm runs mdadm with the given arguments and returns its combined
+// output. It is a variable so that unit tests can fake mdadm.
+var runMdadm = func(args ...string) ([]byte, error) {
+	return common.RunCommand("" /* pipedCmd */, nil /* pipedCmdArg */, "mdadm", args...)
+}
 
-	// We want to get the second element in the array (sample: ARRAY /dev/md126 metadata=1.2 name=csi-driver-data-cache UUID=*),
-	//  which is the path to the RAIDed device
-	return infoSlice[1], nil
+// mdArray is an md array listed by `mdadm --detail --scan`.
+type mdArray struct {
+	// devicePath is the array device, e.g. /dev/md127 or /dev/md/csi-driver-data-cache.
+	devicePath string
+	// name is the value of name= on the ARRAY line, if any. mdadm >= 4.3 no
+	// longer prints it.
+	name string
+}
+
+// parseMdadmDetailScan parses the output of `mdadm --detail --scan`, which
+// prints one line per array, e.g.
+//
+//	ARRAY /dev/md126 metadata=1.2 name=csi-driver-data-cache UUID=...  (mdadm < 4.3)
+//	ARRAY /dev/md127 metadata=1.2 UUID=...                             (mdadm >= 4.3)
+//
+// Lines that are not ARRAY lines (e.g. stderr warnings) are ignored.
+func parseMdadmDetailScan(output string) []mdArray {
+	var arrays []mdArray
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "ARRAY" {
+			continue
+		}
+		array := mdArray{devicePath: fields[1]}
+		for _, field := range fields[2:] {
+			if name, ok := strings.CutPrefix(field, "name="); ok {
+				array.name = name
+			}
+		}
+		arrays = append(arrays, array)
+	}
+	return arrays
+}
+
+// parseMdadmExport parses the MD_*=value lines printed by
+// `mdadm --detail --export <device>`.
+func parseMdadmExport(output string) map[string]string {
+	values := map[string]string{}
+	for _, line := range strings.Split(output, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if ok && strings.HasPrefix(key, "MD_") {
+			values[key] = value
+		}
+	}
+	return values
+}
+
+// isDataCacheArrayName reports whether an md array name refers to the Data
+// Cache array. mdadm stores the name given to `mdadm --create` as
+// "<homehost>:<name>" when that fits in the 32 byte superblock field, and as
+// "<name>" otherwise.
+func isDataCacheArrayName(name string) bool {
+	if i := strings.LastIndex(name, ":"); i >= 0 {
+		name = name[i+1:]
+	}
+	return name == raidedLocalSsdName
+}
+
+// findRAIDedLocalSsdPath returns the device path of the Data Cache RAID array
+// and whether such an array exists.
+//
+// mdadm < 4.3 printed the array name in `mdadm --detail --scan` output, but
+// mdadm 4.3 removed name= from it (upstream commit dcc22ae7, "super1: remove
+// support for name= in config"). On nodes without a /dev/md/<name> udev
+// symlink (e.g. COS), mdadm >= 4.3 therefore only prints
+// "ARRAY /dev/mdN metadata=1.2 UUID=...". The array name is still stored in
+// the md superblock and is reported as MD_NAME by
+// `mdadm --detail --export <device>` on all mdadm versions.
+func findRAIDedLocalSsdPath() (string, bool, error) {
+	info, err := runMdadm("--detail", "--scan")
+	if err != nil {
+		return "", false, fmt.Errorf("errored while scanning for raided LSSD %v: %s", err, info)
+	}
+	arrays := parseMdadmDetailScan(string(info))
+	// Fast path: the array name is visible in the scan output (mdadm < 4.3, or
+	// the /dev/md/<name> symlink exists).
+	for _, array := range arrays {
+		if isDataCacheArrayName(array.name) || isDataCacheArrayName(filepath.Base(array.devicePath)) {
+			return array.devicePath, true, nil
+		}
+	}
+	for _, array := range arrays {
+		details, err := runMdadm("--detail", "--export", array.devicePath)
+		if err != nil {
+			klog.Warningf("Failed to get details of RAID array %s, skipping it: %v", array.devicePath, err)
+			continue
+		}
+		values := parseMdadmExport(string(details))
+		if isDataCacheArrayName(values["MD_NAME"]) || isDataCacheArrayName(values["MD_DEVNAME"]) {
+			return array.devicePath, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+func fetchRAIDedLocalSsdPath() (string, error) {
+	path, found, err := findRAIDedLocalSsdPath()
+	if err != nil {
+		return "", fmt.Errorf("Error getting RAIDed device path for Data Cache: %w", err)
+	}
+	if !found {
+		return "", fmt.Errorf("Error getting RAIDed device path for Data Cache: no RAID array named %q found", raidedLocalSsdName)
+	}
+	return path, nil
 }
 
 func getVgUuid(vgName string) (string, error) {
@@ -579,34 +682,68 @@ func getVgInfoForPv(pvPath string) (string, string, error) {
 	if err != nil {
 		return "", "", fmt.Errorf("failed to run pvs: %w", err)
 	}
-	lines := strings.Split(string(info), "\n")
+	vgName, vgUuid := parsePvsVgInfo(string(info), resolvedPvPath)
+	return vgName, vgUuid, nil
+}
+
+// parsePvsVgInfo extracts the (vg_name, vg_uuid) pair for resolvedPvPath from
+// the combined stdout/stderr output of `pvs --noheadings -o vg_name,vg_uuid,pv_name`.
+//
+// Because common.RunCommand uses CombinedOutput, stderr warning lines such as:
+//   - "WARNING: PV /dev/sdb is marked in use but no VG was found using it."
+//   - "WARNING: PV /dev/sdb in VG csi-vg-... is using an old PV header, modify the VG to update."
+//   - "WARNING: VG csi-vg-... is missing PV ... (last written to [unknown])."
+//
+// are mixed into the output. In "WARNING: PV <dev> ..." lines, fields[2] is the
+// PV device path and fields[0] is "WARNING:", so a `len(fields) >= 3` check
+// matching fields[2] against the PV path would extract "WARNING:" as the VG name.
+//
+// A valid `pvs --noheadings -o vg_name,vg_uuid,pv_name` row for a PV has either:
+//   - 1 field (pv_name) when the PV does not belong to any VG (vg_name and vg_uuid are empty), or
+//   - 3 fields (vg_name, vg_uuid, pv_name) where vg_name and vg_uuid only contain valid LVM name characters.
+func parsePvsVgInfo(output, resolvedPvPath string) (string, string) {
+	lines := strings.Split(output, "\n")
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
-		if line == "" {
+		if line == "" || strings.HasPrefix(line, "WARNING:") {
 			continue
 		}
 		fields := strings.Fields(line)
-		// The fields slice must contain at least 3 elements representing:
-		// fields[0] = vg_name, fields[1] = vg_uuid, fields[2] = pv_name
-		if len(fields) >= 3 {
+		switch len(fields) {
+		case 1:
+			resolvedFieldName, err := filepath.EvalSymlinks(fields[0])
+			if err != nil {
+				resolvedFieldName = fields[0]
+			}
+			if resolvedFieldName == resolvedPvPath {
+				return "", ""
+			}
+		case 3:
 			resolvedFieldName, err := filepath.EvalSymlinks(fields[2])
 			if err != nil {
 				resolvedFieldName = fields[2]
 			}
-			if resolvedFieldName == resolvedPvPath {
-				vgName := fields[0]
-				vgUuid := fields[1]
-				if vgName == "" || vgName == "-" {
-					vgName = ""
-				}
-				if vgUuid == "" || vgUuid == "-" {
-					vgUuid = ""
-				}
-				return vgName, vgUuid, nil
+			if resolvedFieldName != resolvedPvPath {
+				continue
 			}
+			vgName := fields[0]
+			vgUuid := fields[1]
+			if vgName == "-" {
+				vgName = ""
+			}
+			if vgUuid == "-" {
+				vgUuid = ""
+			}
+			if vgName != "" && !isValidVGName(vgName) {
+				continue
+			}
+			if vgUuid != "" && !isValidVGName(vgUuid) {
+				continue
+			}
+			return vgName, vgUuid
 		}
 	}
-	return "", "", nil
+	return "", ""
 }
 
 // isLvCachedOnDevice checks if the logical volume (LV) in the volume group (VG) is cached.
@@ -738,7 +875,19 @@ func reduceVolumeGroup(volumeGroupName string, force bool) {
 	}
 }
 
+// ensureMdadmRunDir makes sure mdadm's runtime directory (see mdadmRunDir)
+// exists so that `mdadm --create` can write its udev-blocking file.
+func ensureMdadmRunDir() error {
+	if err := os.MkdirAll(mdadmRunDir, 0755); err != nil {
+		return fmt.Errorf("failed to create mdadm run directory %q: %w", mdadmRunDir, err)
+	}
+	return nil
+}
+
 func RaidLocalSsds(availableLssds []string) error {
+	if err := ensureMdadmRunDir(); err != nil {
+		return err
+	}
 	args := []string{
 		"--create",
 		raidedLocalSsdName,
@@ -773,18 +922,8 @@ func RaidLocalSsds(availableLssds []string) error {
 }
 
 func IsRaided() (bool, error) {
-	args := []string{
-		"--detail",
-		"--scan",
-	}
-	info, err := common.RunCommand("" /* pipedCmd */, nil /* pipeCmdArg */, "mdadm", args...)
-	if err != nil {
-		return false, fmt.Errorf("errored while scanning for raided LSSD %v: %s", err, info)
-	}
-	if info != nil && strings.Contains(string(info), raidedLocalSsdName) {
-		return true, nil
-	}
-	return false, nil
+	_, found, err := findRAIDedLocalSsdPath()
+	return found, err
 }
 
 func isCachingSetup(mainLvName string) (error, bool) {
